@@ -86,14 +86,16 @@ func (h *wsHub) run() {
 			lastStatusMsg = append(lastStatusMsg, st...)
 			lastStatusMsg = append(lastStatusMsg, '}')
 			for c := range h.conns {
-				c.send <- lastStatusMsg
+				h.send(c, lastStatusMsg)
 			}
 		case c := <-h.register:
 			h.conns[c] = true
-			c.send <- lastStatusMsg
+			h.send(c, lastStatusMsg)
 		case c := <-h.unregister:
-			delete(h.conns, c)
-			close(c.send)
+			if h.conns[c] {
+				delete(h.conns, c)
+				close(c.send)
+			}
 		case camliType := <-h.newBlobRecv:
 			if camliType == "" {
 				// TODO: something smarter. some
@@ -145,8 +147,22 @@ func (h *wsHub) run() {
 			if err != nil {
 				panic(err)
 			}
-			wq.conn.send <- resb
+			h.send(wq.conn, resb)
 		}
+	}
+}
+
+// send queues msg to c without blocking. A connection too slow to keep
+// up is dropped, rather than stalling the hub and everything that
+// sends to it.
+//
+// Runs from the hub's run goroutine.
+func (h *wsHub) send(c *wsConn, msg []byte) {
+	select {
+	case c.send <- msg:
+	default:
+		delete(h.conns, c)
+		close(c.send)
 	}
 }
 
