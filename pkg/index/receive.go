@@ -644,7 +644,18 @@ func (ix *Index) indexReceived(ctx context.Context, blobs []*blob.Blob) error {
 		}
 	}
 	if len(todo) > 0 {
-		be.AddResult(refs, ix.ReceiveBlobs(ctx, todo))
+		err := ix.ReceiveBlobs(ctx, todo)
+		be.AddResult(refs, err)
+		// Tell the index's own blob hub, as a receive routed to the
+		// index did: the search handler listens to it to refresh the
+		// web UI's live queries.
+		indexed := todo[:0:0]
+		for _, b := range todo {
+			if blobserver.BlobErr(err, b.Ref()) == nil {
+				indexed = append(indexed, b)
+			}
+		}
+		blobserver.GetHub(ix).NotifyBlobsReceived(ctx, indexed)
 	}
 	return be.OrNil()
 }

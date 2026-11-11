@@ -22,6 +22,7 @@ import (
 	"sync"
 	"testing"
 	"testing/synctest"
+	"time"
 
 	"perkeep.org/pkg/blob"
 	"perkeep.org/pkg/blobserver"
@@ -149,6 +150,22 @@ func TestIndexReceived(t *testing.T) {
 		return err == nil && strings.HasSuffix(v, "|indexed")
 	}
 
+	// The index's own blob hub is told of what the hook indexes: the
+	// search handler listens to it.
+	announced := make(chan blob.Ref, 10)
+	blobserver.GetHub(ix).RegisterListener(announced)
+	wantAnnounced := func(br blob.Ref) {
+		t.Helper()
+		select {
+		case got := <-announced:
+			if got != br {
+				t.Errorf("the index's blob hub announced %v; want %v", got, br)
+			}
+		case <-time.After(10 * time.Second):
+			t.Errorf("the index's blob hub didn't announce %v", br)
+		}
+	}
+
 	alone := &test.Blob{Contents: `{"camliVersion": 1, "camliType": "static-set", "members": []}`}
 	data := &test.Blob{Contents: "not a schema blob"}
 	if _, err := blobserver.Receive(context.Background(), src, alone.BlobRef(), alone.Reader()); err != nil {
@@ -157,6 +174,7 @@ func TestIndexReceived(t *testing.T) {
 	if !indexed(alone.BlobRef()) {
 		t.Error("schema blob received alone isn't indexed")
 	}
+	wantAnnounced(alone.BlobRef())
 
 	together := &test.Blob{Contents: `{"camliVersion": 1, "camliType": "static-set", "members": [], "x": 1}`}
 	if err := blobserver.ReceiveBlobs(context.Background(), src, []*blob.Blob{together.Blob(), data.Blob()}); err != nil {
@@ -165,6 +183,7 @@ func TestIndexReceived(t *testing.T) {
 	if !indexed(together.BlobRef()) {
 		t.Error("schema blob received with another isn't indexed")
 	}
+	wantAnnounced(together.BlobRef())
 	if indexed(data.BlobRef()) {
 		t.Error("blob that isn't a schema blob was indexed; want it left to the sync to the index")
 	}
