@@ -1,0 +1,256 @@
+/*
+Benchmark of the index's write path with live search attached (scenario W
+of the live-search benchmark suite; see README.md next to this file). It is
+not part of any change: mktrees.sh copies it into each scratch tree as
+pkg/search/lsbench_index_test.go, and it compiles unchanged on builds P
+(e69259ad9), M (master 0e6925347), A (koz1-live-search 1fd04a4a7) and L
+(the live-search change). It needs getrusage, so Unix only.
+
+One op is one permanode plus one camliContent claim (two schema blobs),
+each newer than the last, so every op changes the web UI's default query.
+Sub-benchmarks:
+
+	route=hook       blobserver.Receive into the index's blob source; the
+	                 index indexes it from its receive hook (the server's
+	                 route on M, A and L).
+	route=hookbatch  the same with blobserver.ReceiveBlobs of 8 ops (16
+	                 blobs) per call, as an upload session's batch.
+	route=direct     blobserver.Receive into the index itself, which
+	                 notifies the index's blob hub (the server's route on P).
+	subs=none        no search handler.
+	subs=handler     a search handler (its live-search wiring) and no client.
+	subs=ws1         a search handler and one websocket client, subscribed
+	                 to the web UI's default query, that reads everything.
+
+The timed region ends with a barrier, so asynchronous work is counted:
+with ws1, until the client has a result showing the last op's claim; with
+handler, until the goroutine count is back to where it started (P and A
+hand each blob to a listener goroutine).
+
+On a build that paces a subscription's searches (L starts them at least a
+second apart), the ws1 barrier waits out that pacing, so ns/op on ws1 is
+mostly idle time. cpu-ns/op, the process's user plus system CPU time over
+the timed region per op, is the cost to compare there.
+*/
+
+package search
+
+import (
+	"bytes"
+	"context"
+	"fmt"
+	"io"
+	"log"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"sync/atomic"
+	"syscall"
+	"testing"
+	"time"
+
+	"github.com/gorilla/websocket"
+	"go4.org/jsonconfig"
+
+	"perkeep.org/pkg/blob"
+	"perkeep.org/pkg/blobserver"
+	"perkeep.org/pkg/index"
+	"perkeep.org/pkg/index/indextest"
+	"perkeep.org/pkg/jsonsign"
+	"perkeep.org/pkg/schema"
+	"perkeep.org/pkg/test"
+)
+
+const lsbUIQuery = `{"sort":"-created","constraint":{"permanode":{"skipHidden":true}},"limit":50,"describe":{"depth":1,"rules":[{"attrs":["camliContent","camliContentImage"]}]}}`
+
+type lsbOp struct {
+	pn, claim *test.Blob
+	content   string // the claim's value, unique per op
+}
+
+// lsbSigner signs with the test key (indextest.PubKey).
+type lsbSigner struct {
+	pub blob.Fetcher
+	ent jsonsign.EntityFetcher
+}
+
+func (s lsbSigner) sign(b *testing.B, m *schema.Builder, t time.Time) *test.Blob {
+	m.SetSigner(indextest.PubKey.BlobRef())
+	unsigned, err := m.JSON()
+	if err != nil {
+		b.Fatal(err)
+	}
+	sr := &jsonsign.SignRequest{
+		UnsignedJSON:  unsigned,
+		Fetcher:       s.pub,
+		EntityFetcher: s.ent,
+		SignatureTime: t,
+	}
+	signed, err := sr.Sign(context.Background())
+	if err != nil {
+		b.Fatal(err)
+	}
+	return &test.Blob{Contents: signed}
+}
+
+func BenchmarkLiveIndexWrite(b *testing.B) {
+	log.SetOutput(io.Discard) // the corpus logs as it loads
+	defer log.SetOutput(os.Stderr)
+	for _, route := range []string{"hook", "hookbatch", "direct"} {
+		for _, subs := range []string{"none", "handler", "ws1"} {
+			b.Run("route="+route+"/subs="+subs, func(b *testing.B) { lsbRun(b, route, subs) })
+		}
+	}
+}
+
+func lsbRun(b *testing.B, route, subs string) {
+	ctx := context.Background()
+	// The memory index as the server builds an index from its config:
+	// with its receive hook on its blob source.
+	src := new(test.Fetcher)
+	src.AddBlob(indextest.PubKey)
+	ld := test.NewLoader()
+	ld.SetStorage("/bs/", src)
+	sto, err := blobserver.CreateStorage("memory-only-dev-indexer", ld, jsonconfig.Obj{"blobSource": "/bs/"})
+	if err != nil {
+		b.Fatal(err)
+	}
+	idx := sto.(*index.Index)
+	sg := lsbSigner{pub: src, ent: &jsonsign.CachingEntityFetcher{
+		Fetcher: &jsonsign.FileEntityFetcher{File: filepath.Join("..", "jsonsign", "testdata", "test-secring.gpg")},
+	}}
+	corpus, err := idx.KeepInMemory()
+	if err != nil {
+		b.Fatal(err)
+	}
+	var h *Handler
+	if subs != "none" {
+		h = NewHandler(idx, index.NewOwner(indextest.KeyID, indextest.PubKey.BlobRef()))
+		h.SetCorpus(corpus)
+	}
+
+	// Sign everything before the clock starts.
+	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	ops := make([]lsbOp, b.N)
+	for i := range ops {
+		t := base.Add(time.Duration(i) * time.Second)
+		pn := sg.sign(b, schema.NewUnsignedPermanode(), t)
+		content := blob.RefFromString(fmt.Sprintf("content %d", i)).String()
+		cl := schema.NewSetAttributeClaim(pn.BlobRef(), "camliContent", content)
+		cl.SetClaimDate(t.Add(500 * time.Millisecond))
+		ops[i] = lsbOp{pn: pn, claim: sg.sign(b, cl, t.Add(500*time.Millisecond)), content: content}
+	}
+
+	var msgs atomic.Int64
+	var last atomic.Pointer[[]byte]
+	if subs == "ws1" {
+		srv := httptest.NewServer(http.HandlerFunc(h.serveWebSocket))
+		defer srv.Close()
+		c, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(srv.URL, "http"), nil)
+		if err != nil {
+			b.Fatal(err)
+		}
+		defer c.Close()
+		if err := c.WriteMessage(websocket.TextMessage, []byte(`{"tag":"q1","query":`+lsbUIQuery+`}`)); err != nil {
+			b.Fatal(err)
+		}
+		first := make(chan struct{})
+		go func() {
+			gotFirst := false
+			for {
+				_, p, err := c.ReadMessage()
+				if err != nil {
+					return
+				}
+				if bytes.HasPrefix(p, []byte(`{"tag":"q1"`)) {
+					msgs.Add(1)
+					last.Store(&p)
+					if !gotFirst {
+						gotFirst = true
+						close(first)
+					}
+				}
+			}
+		}()
+		select {
+		case <-first:
+		case <-time.After(10 * time.Second):
+			b.Fatal("no first result")
+		}
+		msgs.Store(0)
+	}
+	g0 := runtime.NumGoroutine()
+
+	receive := func(dst blobserver.BlobReceiver, tb *test.Blob) {
+		if route == "direct" {
+			src.AddBlob(tb)
+		}
+		if _, err := blobserver.Receive(ctx, dst, tb.BlobRef(), tb.Reader()); err != nil {
+			b.Fatal(err)
+		}
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	cpu0 := lsbCPU(b)
+	switch route {
+	case "hook":
+		for _, op := range ops {
+			receive(src, op.pn)
+			receive(src, op.claim)
+		}
+	case "direct":
+		for _, op := range ops {
+			receive(idx, op.pn)
+			receive(idx, op.claim)
+		}
+	case "hookbatch":
+		for i := 0; i < len(ops); i += 8 {
+			var bs []*blob.Blob
+			for _, op := range ops[i:min(i+8, len(ops))] {
+				bs = append(bs, op.pn.Blob(), op.claim.Blob())
+			}
+			if err := blobserver.ReceiveBlobs(ctx, src, bs); err != nil {
+				b.Fatal(err)
+			}
+		}
+	}
+	// Barrier.
+	deadline := time.Now().Add(5 * time.Second)
+	switch subs {
+	case "ws1":
+		want := []byte(ops[len(ops)-1].content)
+		for {
+			if p := last.Load(); p != nil && bytes.Contains(*p, want) {
+				break
+			}
+			if time.Now().After(deadline) {
+				// P and M announce nothing on the hook route: no
+				// live update, so nothing to time.
+				b.StopTimer()
+				b.Skipf("no live update in 5 s (%d messages): this build does not announce this route", msgs.Load())
+			}
+			time.Sleep(time.Millisecond) // not finer: polling costs CPU, and cpu-ns/op counts it
+		}
+	case "handler":
+		for runtime.NumGoroutine() > g0 && time.Now().Before(deadline) {
+			time.Sleep(time.Millisecond) // not finer: polling costs CPU, and cpu-ns/op counts it
+		}
+	}
+	b.StopTimer()
+	b.ReportMetric(float64(lsbCPU(b)-cpu0)/float64(b.N), "cpu-ns/op")
+	if subs == "ws1" {
+		b.ReportMetric(float64(msgs.Load())/float64(b.N), "msgs/op")
+	}
+}
+
+// lsbCPU returns the process's user plus system CPU time in nanoseconds.
+func lsbCPU(b *testing.B) int64 {
+	var ru syscall.Rusage
+	if err := syscall.Getrusage(syscall.RUSAGE_SELF, &ru); err != nil {
+		b.Fatal(err)
+	}
+	return ru.Utime.Nano() + ru.Stime.Nano()
+}
