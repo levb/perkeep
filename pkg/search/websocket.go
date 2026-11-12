@@ -133,11 +133,15 @@ func (h *wsHub) run() {
 			if debug {
 				log.Printf("websocket: added/updated search subscription for tag %q", wr.tag)
 			}
-			go h.doSearch(wq)
+			// Through redoSearch, like every later search of wq, so
+			// that searches of wq run one at a time and the last to
+			// finish has the newest result.
+			go h.redoSearch(wq)
 
 		case wq := <-h.updatedResults:
-			if !h.conns[wq.conn] || wq.conn.queries[wq.tag] == nil {
-				// Client has since disconnected or unsubscribed.
+			if !h.conns[wq.conn] || wq.conn.queries[wq.tag] != wq {
+				// Client has since disconnected, unsubscribed, or
+				// replaced the search of this tag with another.
 				continue
 			}
 			wq.mu.Lock()
