@@ -82,9 +82,8 @@ func NewHandler(ix index.Interface, owner *index.Owner) *Handler {
 		owner: owner,
 	}
 	sh.lh = index.NewLocationHelper(sh.index.(*index.Index))
-	sh.wsHub = newWebsocketHub(sh)
+	sh.wsHub = newWebsocketHub(sh, sh.index.(*index.Index).SchemaBlobIndexed())
 	go sh.wsHub.run()
-	sh.subscribeToNewBlobs()
 	return sh
 }
 
@@ -96,22 +95,6 @@ func (h *Handler) InitHandler(lh blobserver.FindHandlerByTyper) error {
 	h.fetcher = handler.(blob.Fetcher)
 	registerKeyword(newNamedSearch(h))
 	return nil
-}
-
-func (h *Handler) subscribeToNewBlobs() {
-	ch := make(chan blob.Ref, buffered)
-	blobserver.GetHub(h.index).RegisterListener(ch)
-	go func() {
-		ctx := context.Background()
-		for br := range ch {
-			unlock := h.index.RLock()
-			bm, err := h.index.GetBlobMeta(ctx, br)
-			if err == nil {
-				h.wsHub.newBlobRecv <- bm.CamliType
-			}
-			unlock()
-		}
-	}()
 }
 
 func (h *Handler) SetCorpus(c *index.Corpus) {

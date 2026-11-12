@@ -18,10 +18,12 @@ package index
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
 	"testing/synctest"
+	"time"
 
 	"perkeep.org/pkg/blob"
 	"perkeep.org/pkg/blobserver"
@@ -167,5 +169,90 @@ func TestIndexReceived(t *testing.T) {
 	}
 	if indexed(data.BlobRef()) {
 		t.Error("blob that isn't a schema blob was indexed; want it left to the sync to the index")
+	}
+}
+
+// TestSchemaBlobIndexed checks that the channel from SchemaBlobIndexed
+// has a value whenever the index has indexed a schema blob, however the
+// blob reached the index, and none otherwise.
+func TestSchemaBlobIndexed(t *testing.T) {
+	ix := NewMemoryIndex()
+	ix.Logger = test.NewLogger(t, "")
+	src := new(test.Fetcher)
+	ix.InitBlobSource(src)
+	ix.hookBlobSource(src)
+	indexed := ix.SchemaBlobIndexed()
+	unread := ix.SchemaBlobIndexed() // nothing receives from it
+	want := func(what string, has bool) {
+		t.Helper()
+		select {
+		case <-indexed:
+			if !has {
+				t.Errorf("%s: the channel has a value; want none", what)
+			}
+		default:
+			if has {
+				t.Errorf("%s: the channel has no value; want one", what)
+			}
+		}
+	}
+	ctx := context.Background()
+	// do runs a step, and fails the test if it hasn't returned within
+	// 10 seconds: if the index ever waited to send to a channel nobody
+	// receives from, the test would otherwise hang.
+	do := func(what string, f func() error) {
+		t.Helper()
+		errc := make(chan error, 1)
+		go func() { errc <- f() }()
+		select {
+		case err := <-errc:
+			if err != nil {
+				t.Fatalf("%s: %v", what, err)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatalf("%s: still running after 10s", what)
+		}
+	}
+	schemaBlob := func(n int) *test.Blob {
+		return &test.Blob{Contents: fmt.Sprintf(`{"camliVersion": 1, "camliType": "static-set", "members": [], "n": %d}`, n)}
+	}
+
+	want("before any blob", false)
+
+	// From the receive hook on the blob source, as an upload.
+	b := schemaBlob(1)
+	do("receive b", func() error { _, err := blobserver.Receive(ctx, src, b.BlobRef(), b.Reader()); return err })
+	want("schema blob received into the blob source", true)
+
+	// Again, as a storage-replica config or the sync gives the index a
+	// blob its hook has indexed already.
+	do("receive b", func() error { _, err := blobserver.ReceiveNoHash(ctx, ix, b.BlobRef(), b.Reader()); return err })
+	want("schema blob already indexed", false)
+
+	data := &test.Blob{Contents: "not a schema blob"}
+	do("receive data", func() error { _, err := blobserver.Receive(ctx, ix, data.BlobRef(), data.Reader()); return err })
+	want("blob that isn't a schema blob", false)
+
+	// From the sync to the index, which doesn't tell any blob hub.
+	// Two blobs are one value.
+	b2, b3 := schemaBlob(2), schemaBlob(3)
+	do("sync", func() error { return blobserver.ReceiveBlobsUnchecked(ctx, ix, []*blob.Blob{b2.Blob(), b3.Blob()}) })
+	want("two schema blobs from a sync", true)
+	want("after receiving their value", false)
+
+	// Indexed late: a file whose chunk arrives after it.
+	chunk := &test.Blob{Contents: "foo"}
+	file := &test.Blob{Contents: fmt.Sprintf(`{"camliVersion": 1, "camliType": "file", "fileName": "f.txt", "parts": [{"blobRef": %q, "size": 3}]}`, chunk.BlobRef())}
+	do("receive file", func() error { _, err := blobserver.Receive(ctx, src, file.BlobRef(), file.Reader()); return err })
+	want("file before its chunk", false)
+	do("receive chunk", func() error { _, err := blobserver.Receive(ctx, src, chunk.BlobRef(), chunk.Reader()); return err })
+	do("sync", func() error { return blobserver.ReceiveBlobsUnchecked(ctx, ix, []*blob.Blob{chunk.Blob()}) })
+	do("indexing late", func() error { ix.awaitReadyIdle(); return nil })
+	want("file indexed once its chunk arrived", true)
+
+	// A channel nothing receives from holds one value, and didn't
+	// keep the index from indexing any of the above.
+	if len(unread) != 1 {
+		t.Errorf("the channel nothing received from has %d values; want 1", len(unread))
 	}
 }
