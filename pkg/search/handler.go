@@ -106,10 +106,13 @@ func (h *Handler) subscribeToNewBlobs() {
 		for br := range ch {
 			unlock := h.index.RLock()
 			bm, err := h.index.GetBlobMeta(ctx, br)
+			unlock()
 			if err == nil {
+				// Not with the index read-locked: the hub can
+				// take as long to receive this as a websocket
+				// client takes to read.
 				h.wsHub.newBlobRecv <- bm.CamliType
 			}
-			unlock()
 		}
 	}()
 }
