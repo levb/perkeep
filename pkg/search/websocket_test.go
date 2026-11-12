@@ -284,6 +284,7 @@ func (c *closeNotifyConn) Close() error {
 func TestWebsocketStalledClientDisconnected(t *testing.T) {
 	wt := newWSTest(t)
 	wt.h.wsHub.writeTimeout = 100 * time.Millisecond
+	wt.h.wsHub.searchInterval = 0 // a result per blob, to back the writes up soon
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -332,5 +333,61 @@ func TestWebsocketStalledClientDisconnected(t *testing.T) {
 	case <-cln.closed:
 	case <-time.After(10 * time.Second):
 		t.Fatal("the server hasn't closed the connection of a client that stopped reading")
+	}
+}
+
+// TestWebsocketSearchInterval checks that a subscription's searches
+// start at least the hub's search interval apart, so that a burst of
+// blobs shares searches, and that the last search still sees the last
+// blob.
+func TestWebsocketSearchInterval(t *testing.T) {
+	wt := newWSTest(t)
+	const interval = 100 * time.Millisecond
+	wt.h.wsHub.searchInterval = interval
+	c := wt.conn()
+
+	// Take results as they come, as writePump does, and count them
+	// until one has the last blob.
+	lastc := make(chan string, 1)
+	counted := make(chan int, 1) // or -1 after 10s without one
+	go func() {
+		n, want := 0, ""
+		var newest []byte
+		for {
+			select {
+			case want = <-lastc:
+			case <-c.ready:
+				out, _ := c.take()
+				for _, m := range out {
+					if m.tag == "q" {
+						n++
+						newest = m.msg
+					}
+				}
+			case <-time.After(10 * time.Second):
+				counted <- -1
+				return
+			}
+			if want != "" && bytes.Contains(newest, []byte(want)) {
+				counted <- n
+				return
+			}
+		}
+	}()
+
+	start := time.Now()
+	var last blob.Ref
+	for range 30 {
+		last = wt.receive()
+	}
+	lastc <- last.String()
+	n := <-counted
+	elapsed := time.Since(start)
+	if n < 0 {
+		t.Fatalf("no search result with the last permanode %v", last)
+	}
+	// One search can start at once, then one per interval.
+	if max := 2 + int(elapsed/interval); n > max {
+		t.Errorf("got %d results in %v; want at most %d with searches %v apart", n, elapsed, max, interval)
 	}
 }

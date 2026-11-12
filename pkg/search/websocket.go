@@ -44,6 +44,9 @@ const (
 
 	// Maximum message size allowed from peer.
 	maxMessageSize = 10 << 10
+
+	// Least time between the starts of two searches of one subscription.
+	minSearchInterval = time.Second
 )
 
 var debug, _ = strconv.ParseBool(os.Getenv("CAMLI_DEBUG"))
@@ -62,6 +65,13 @@ type wsHub struct {
 	// change it before the hub has clients.
 	writeTimeout time.Duration
 
+	// searchInterval is the least time between the starts of two
+	// searches of one subscription, so that the changes of a burst,
+	// such as an upload of many files, share searches:
+	// minSearchInterval, but tests change it before the hub has
+	// clients.
+	searchInterval time.Duration
+
 	// Owned by func run:
 	conns map[*wsConn]bool
 }
@@ -77,6 +87,7 @@ func newWebsocketHub(sh *Handler, changed <-chan struct{}) *wsHub {
 		updatedResults: make(chan *watchedQuery, buffered),
 		statusUpdate:   make(chan json.RawMessage, buffered),
 		writeTimeout:   writeWait,
+		searchInterval: minSearchInterval,
 	}
 }
 
@@ -162,7 +173,8 @@ func (h *wsHub) run() {
 // redoSearch is called (in its own goroutine) when a new schema blob
 // arrives to note that wq might now have new results and we should
 // re-run it.  But because a search can take awhile, don't run more
-// than one refresh at a time.
+// than one refresh at a time, nor start one sooner than h.searchInterval
+// after the last: the changes in between share it.
 func (h *wsHub) redoSearch(wq *watchedQuery) {
 	wq.mu.Lock()
 	defer wq.mu.Unlock()
@@ -172,9 +184,15 @@ func (h *wsHub) redoSearch(wq *watchedQuery) {
 		// One's enough.
 		return
 	}
+	wq.refreshing = true
 	for wq.dirty {
-		wq.refreshing = true
+		if wait := h.searchInterval - time.Since(wq.lastSearch); wait > 0 {
+			wq.mu.Unlock()
+			time.Sleep(wait)
+			wq.mu.Lock()
+		}
 		wq.dirty = false
+		wq.lastSearch = time.Now()
 		wq.mu.Unlock() // release lock while running query; might become dirty meanwhile
 		h.doSearch(wq)
 		wq.mu.Lock() // before checking wq.dirty
@@ -299,8 +317,9 @@ type watchedQuery struct {
 	q    *SearchQuery
 
 	mu         sync.Mutex // guards following
-	refreshing bool       // search is currently running
+	refreshing bool       // search is currently running, or waiting to
 	dirty      bool       // new schema blob arrived while refreshing; another refresh due
+	lastSearch time.Time  // when the last search started
 	lastres    *SearchResult
 	lastresj   []byte // as JSON
 }
