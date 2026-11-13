@@ -24,13 +24,12 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"slices"
 	"strconv"
 	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
-
-	"perkeep.org/pkg/schema"
 )
 
 const (
@@ -54,24 +53,30 @@ type wsHub struct {
 	register       chan *wsConn
 	unregister     chan *wsConn
 	watchReq       chan watchReq
-	newBlobRecv    chan schema.CamliType // new blob received.
+	changed        <-chan struct{} // see Index.SubscribeSchemaChanges
 	updatedResults chan *watchedQuery
 	statusUpdate   chan json.RawMessage
+
+	// Tests may change these before the hub has clients.
+	writeTimeout   time.Duration // how long writePump waits to write a message
+	searchInterval time.Duration // least time between the starts of a subscription's searches
 
 	// Owned by func run:
 	conns map[*wsConn]bool
 }
 
-func newWebsocketHub(sh *Handler) *wsHub {
+func newWebsocketHub(sh *Handler, changed <-chan struct{}) *wsHub {
 	return &wsHub{
 		sh:             sh,
 		register:       make(chan *wsConn), // unbuffered; issue 563
 		unregister:     make(chan *wsConn), // unbuffered; issue 563
 		conns:          make(map[*wsConn]bool),
 		watchReq:       make(chan watchReq, buffered),
-		newBlobRecv:    make(chan schema.CamliType, buffered),
+		changed:        changed,
 		updatedResults: make(chan *watchedQuery, buffered),
 		statusUpdate:   make(chan json.RawMessage, buffered),
+		writeTimeout:   writeWait,
+		searchInterval: time.Second,
 	}
 }
 
@@ -80,31 +85,31 @@ func (h *wsHub) run() {
 	for {
 		select {
 		case st := <-h.statusUpdate:
-			const prefix = `{"tag":"_status","status":`
+			const prefix = `{"tag":"` + statusTag + `","status":`
 			lastStatusMsg = make([]byte, 0, len(prefix)+len(st)+1)
 			lastStatusMsg = append(lastStatusMsg, prefix...)
 			lastStatusMsg = append(lastStatusMsg, st...)
 			lastStatusMsg = append(lastStatusMsg, '}')
 			for c := range h.conns {
-				c.send <- lastStatusMsg
+				c.put(statusTag, lastStatusMsg)
 			}
 		case c := <-h.register:
 			h.conns[c] = true
-			c.send <- lastStatusMsg
+			if lastStatusMsg != nil {
+				// The web UI parses the first message as JSON.
+				c.put(statusTag, lastStatusMsg)
+			}
 		case c := <-h.unregister:
 			delete(h.conns, c)
-			close(c.send)
-		case camliType := <-h.newBlobRecv:
-			if camliType == "" {
-				// TODO: something smarter. some
-				// queries might care about all blobs.
-				// But for now only re-kick off
-				// queries if schema blobs arrive.  We
-				// should track per-WatchdQuery which
-				// blob types the search cares about.
-				continue
-			}
-			// New blob was received. Kick off standing search queries to see if any changed.
+			c.close()
+		case <-h.changed:
+			// The index has indexed a schema blob. Kick off standing
+			// search queries to see if any changed.
+			//
+			// TODO: something smarter. Some queries might care about
+			// all blobs, but the index only tells us of schema blobs.
+			// We should track per watchedQuery which blob types the
+			// search cares about.
 			for conn := range h.conns {
 				for _, wq := range conn.queries {
 					go h.redoSearch(wq)
@@ -114,7 +119,7 @@ func (h *wsHub) run() {
 			// Unsubscribe
 			if wr.q == nil {
 				delete(wr.conn.queries, wr.tag)
-				log.Printf("Removed subscription for %v, %q", wr.conn, wr.tag)
+				log.Printf("websocket: removed subscription %q for %p", wr.tag, wr.conn)
 				continue
 			}
 			// Very similar type, but semantically
@@ -128,11 +133,15 @@ func (h *wsHub) run() {
 			if debug {
 				log.Printf("websocket: added/updated search subscription for tag %q", wr.tag)
 			}
-			go h.doSearch(wq)
+			// Through redoSearch, like every later search of wq, so
+			// that searches of wq run one at a time and the last to
+			// finish has the newest result.
+			go h.redoSearch(wq)
 
 		case wq := <-h.updatedResults:
-			if !h.conns[wq.conn] || wq.conn.queries[wq.tag] == nil {
-				// Client has since disconnected or unsubscribed.
+			if !h.conns[wq.conn] || wq.conn.queries[wq.tag] != wq {
+				// Client has since disconnected, unsubscribed, or
+				// replaced the search of this tag with another.
 				continue
 			}
 			wq.mu.Lock()
@@ -145,7 +154,7 @@ func (h *wsHub) run() {
 			if err != nil {
 				panic(err)
 			}
-			wq.conn.send <- resb
+			wq.conn.put(wq.tag, resb)
 		}
 	}
 }
@@ -153,7 +162,8 @@ func (h *wsHub) run() {
 // redoSearch is called (in its own goroutine) when a new schema blob
 // arrives to note that wq might now have new results and we should
 // re-run it.  But because a search can take awhile, don't run more
-// than one refresh at a time.
+// than one refresh at a time, nor start one sooner than h.searchInterval
+// after the last: the changes in between share it.
 func (h *wsHub) redoSearch(wq *watchedQuery) {
 	wq.mu.Lock()
 	defer wq.mu.Unlock()
@@ -163,9 +173,15 @@ func (h *wsHub) redoSearch(wq *watchedQuery) {
 		// One's enough.
 		return
 	}
+	wq.refreshing = true
 	for wq.dirty {
-		wq.refreshing = true
+		if wait := h.searchInterval - time.Since(wq.lastSearch); wait > 0 {
+			wq.mu.Unlock()
+			time.Sleep(wait)
+			wq.mu.Lock()
+		}
 		wq.dirty = false
+		wq.lastSearch = time.Now()
 		wq.mu.Unlock() // release lock while running query; might become dirty meanwhile
 		h.doSearch(wq)
 		wq.mu.Lock() // before checking wq.dirty
@@ -200,13 +216,84 @@ func (h *wsHub) doSearch(wq *watchedQuery) {
 	h.updatedResults <- wq
 }
 
+// statusTag is the tag of status messages, as the web UI knows it.
+const statusTag = "_status"
+
+// wsConn is a websocket client of the hub.
 type wsConn struct {
-	ws   *websocket.Conn
-	send chan []byte // Buffered channel of outbound messages.
-	sh   *Handler
+	ws *websocket.Conn
+	sh *Handler
 
 	// queries is owned by the wsHub.run goroutine.
 	queries map[string]*watchedQuery // tag -> subscription
+
+	// ready has a value when out has messages for writePump, or the
+	// connection is closed.
+	ready chan struct{}
+
+	mu     sync.Mutex // guards following
+	out    []outMsg   // see put
+	closed bool       // by close
+}
+
+// outMsg is a message to a websocket client: a whole search result or
+// status.
+type outMsg struct {
+	tag string
+	msg []byte
+}
+
+func newWSConn(sh *Handler, ws *websocket.Conn) *wsConn {
+	return &wsConn{
+		ws:      ws,
+		sh:      sh,
+		queries: make(map[string]*watchedQuery),
+		ready:   make(chan struct{}, 1),
+	}
+}
+
+// put queues msg for c's writePump, replacing any unsent message of
+// tag: a message is whole, so only the newest matters. It never waits
+// for the client. It's called by the hub's run goroutine.
+func (c *wsConn) put(tag string, msg []byte) {
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return
+	}
+	if i := slices.IndexFunc(c.out, func(m outMsg) bool { return m.tag == tag }); i >= 0 {
+		c.out[i].msg = msg
+	} else {
+		c.out = append(c.out, outMsg{tag, msg})
+	}
+	c.mu.Unlock()
+	c.wake()
+}
+
+// close has c's writePump close the connection, without sending what
+// it hasn't sent yet. It's called by the hub's run goroutine once the
+// client has gone.
+func (c *wsConn) close() {
+	c.mu.Lock()
+	c.closed = true
+	c.out = nil
+	c.mu.Unlock()
+	c.wake()
+}
+
+func (c *wsConn) wake() {
+	select {
+	case c.ready <- struct{}{}:
+	default: // writePump has a wake-up to take already
+	}
+}
+
+// take returns the messages to send, and whether c is closed.
+func (c *wsConn) take() (out []outMsg, closed bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out, c.out = c.out, nil
+	return out, c.closed
 }
 
 type watchedQuery struct {
@@ -215,8 +302,9 @@ type watchedQuery struct {
 	q    *SearchQuery
 
 	mu         sync.Mutex // guards following
-	refreshing bool       // search is currently running
+	refreshing bool       // search is currently running, or waiting to
 	dirty      bool       // new schema blob arrived while refreshing; another refresh due
+	lastSearch time.Time  // when the last search started
 	lastres    *SearchResult
 	lastresj   []byte // as JSON
 }
@@ -273,7 +361,7 @@ func (c *wsConn) readPump() {
 
 // write writes a message with the given message type and payload.
 func (c *wsConn) write(mt int, payload []byte) error {
-	c.ws.SetWriteDeadline(time.Now().Add(writeWait))
+	c.ws.SetWriteDeadline(time.Now().Add(c.sh.wsHub.writeTimeout))
 	return c.ws.WriteMessage(mt, payload)
 }
 
@@ -286,13 +374,16 @@ func (c *wsConn) writePump() {
 	}()
 	for {
 		select {
-		case message, ok := <-c.send:
-			if !ok {
+		case <-c.ready:
+			out, closed := c.take()
+			if closed {
 				c.write(websocket.CloseMessage, []byte{})
 				return
 			}
-			if err := c.write(websocket.TextMessage, message); err != nil {
-				return
+			for _, m := range out {
+				if err := c.write(websocket.TextMessage, m.msg); err != nil {
+					return
+				}
 			}
 		case <-ticker.C:
 			if err := c.write(websocket.PingMessage, []byte{}); err != nil {
@@ -319,12 +410,7 @@ func (h *Handler) serveWebSocket(rw http.ResponseWriter, req *http.Request) {
 		log.Println(err)
 		return
 	}
-	c := &wsConn{
-		ws:      ws,
-		send:    make(chan []byte, 256),
-		sh:      h,
-		queries: make(map[string]*watchedQuery),
-	}
+	c := newWSConn(h, ws)
 	h.wsHub.register <- c
 	go c.writePump()
 	c.readPump()

@@ -121,6 +121,44 @@ func TestWebsocketQuery(t *testing.T) {
 	}
 }
 
+// TestWebsocketLiveQuery checks that a search subscribed to over a
+// websocket, as the web UI's are, is sent its new result when an upload
+// changes it.
+func TestWebsocketLiveQuery(t *testing.T) {
+	w := test.GetWorld(t)
+
+	searchURL := (&url.URL{Scheme: "ws", Host: w.Addr(), Path: w.SearchHandlerPath() + "ws"}).String()
+	wc, _, err := websocket.DefaultDialer.Dial(searchURL, http.Header{
+		"Origin": {"http://" + w.Addr()},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wc.Close()
+	if err := wc.WriteMessage(websocket.TextMessage, []byte(`{"tag": "live", "query": {"expression": "tag:livequery"}}`)); err != nil {
+		t.Fatal(err)
+	}
+	// result reads until a result of the search that contains want.
+	result := func(want string) {
+		t.Helper()
+		wc.SetReadDeadline(time.Now().Add(10 * time.Second))
+		for {
+			_, msg, err := wc.ReadMessage()
+			if err != nil {
+				t.Fatalf("reading the search's result with %q: %v", want, err)
+			}
+			if strings.HasPrefix(string(msg), `{"tag":"live"`) && strings.Contains(string(msg), want) {
+				return
+			}
+		}
+	}
+	result("") // the first, of nothing
+
+	pn := w.NewPermanode(t)
+	test.MustRunCmd(t, w.Cmd("pk-put", "attr", pn.String(), "tag", "livequery"))
+	result(pn.String())
+}
+
 func TestInternalHandler(t *testing.T) {
 	w := test.GetWorld(t)
 	tests := map[string]int{

@@ -95,6 +95,7 @@ type Index struct {
 
 	mu sync.RWMutex // guards following
 
+	schemaChangeSubs []chan struct{} // one per SubscribeSchemaChanges calle
 	// inFlight is the set of ReceiveBlob calls currently in progress.
 	inFlight set.Set[*indexOp]
 
@@ -220,6 +221,23 @@ func (x *Index) InitBlobSource(blobSource blobserver.FetcherEnumerator) {
 	if x.KeyFetcher == nil {
 		x.KeyFetcher = blobSource
 	}
+}
+
+// SubscribeSchemaChanges returns a new channel that gets a value
+// whenever the index has added schema blobs, the only blobs that can
+// change search results. Many additions may share one value: a search
+// run after receiving it sees all of them. The index never waits on the
+// channel.
+//
+// Each call makes a new channel that the index keeps for its lifetime,
+// so call it once per listener, not per request. The caller must not
+// hold the index lock.
+func (x *Index) SubscribeSchemaChanges() <-chan struct{} {
+	ch := make(chan struct{}, 1)
+	x.Lock()
+	defer x.Unlock()
+	x.schemaChangeSubs = append(x.schemaChangeSubs, ch)
+	return ch
 }
 
 // New returns a new index using the provided key/value storage implementation.
