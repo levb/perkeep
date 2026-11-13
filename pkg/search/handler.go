@@ -81,8 +81,9 @@ func NewHandler(ix index.Interface, owner *index.Owner) *Handler {
 		index: ix,
 		owner: owner,
 	}
-	sh.lh = index.NewLocationHelper(sh.index.(*index.Index))
-	sh.wsHub = newWebsocketHub(sh, sh.index.(*index.Index).SchemaBlobIndexed())
+	idx := sh.index.(*index.Index)
+	sh.lh = index.NewLocationHelper(idx)
+	sh.wsHub = newWebsocketHub(sh, idx.SchemaBlobIndexed())
 	go sh.wsHub.run()
 	return sh
 }

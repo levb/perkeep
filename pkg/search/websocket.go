@@ -44,9 +44,6 @@ const (
 
 	// Maximum message size allowed from peer.
 	maxMessageSize = 10 << 10
-
-	// Least time between the starts of two searches of one subscription.
-	minSearchInterval = time.Second
 )
 
 var debug, _ = strconv.ParseBool(os.Getenv("CAMLI_DEBUG"))
@@ -60,17 +57,9 @@ type wsHub struct {
 	updatedResults chan *watchedQuery
 	statusUpdate   chan json.RawMessage
 
-	// writeTimeout is how long a client's writePump waits to write a
-	// message before giving up on the client: writeWait, but tests
-	// change it before the hub has clients.
-	writeTimeout time.Duration
-
-	// searchInterval is the least time between the starts of two
-	// searches of one subscription, so that the changes of a burst,
-	// such as an upload of many files, share searches:
-	// minSearchInterval, but tests change it before the hub has
-	// clients.
-	searchInterval time.Duration
+	// Tests may change these before the hub has clients.
+	writeTimeout   time.Duration // how long writePump waits to write a message
+	searchInterval time.Duration // least time between the starts of a subscription's searches
 
 	// Owned by func run:
 	conns map[*wsConn]bool
@@ -87,7 +76,7 @@ func newWebsocketHub(sh *Handler, changed <-chan struct{}) *wsHub {
 		updatedResults: make(chan *watchedQuery, buffered),
 		statusUpdate:   make(chan json.RawMessage, buffered),
 		writeTimeout:   writeWait,
-		searchInterval: minSearchInterval,
+		searchInterval: time.Second,
 	}
 }
 
@@ -96,7 +85,7 @@ func (h *wsHub) run() {
 	for {
 		select {
 		case st := <-h.statusUpdate:
-			const prefix = `{"tag":"_status","status":`
+			const prefix = `{"tag":"` + statusTag + `","status":`
 			lastStatusMsg = make([]byte, 0, len(prefix)+len(st)+1)
 			lastStatusMsg = append(lastStatusMsg, prefix...)
 			lastStatusMsg = append(lastStatusMsg, st...)
@@ -247,8 +236,8 @@ type wsConn struct {
 	closed bool       // by close
 }
 
-// outMsg is a message to a websocket client: a search's result or a
-// status, the whole of it.
+// outMsg is a message to a websocket client: a whole search result or
+// status.
 type outMsg struct {
 	tag string
 	msg []byte
@@ -263,13 +252,9 @@ func newWSConn(sh *Handler, ws *websocket.Conn) *wsConn {
 	}
 }
 
-// put has c's writePump send msg, the newest message of tag, in place
-// of any message of tag it hasn't sent yet. A message is a search's
-// whole result, or the whole status, so a slow client still ends up
-// with the newest, and c holds at most one message of each tag. put
-// never waits for the client.
-//
-// It's called by the hub's run goroutine.
+// put queues msg for c's writePump, replacing any unsent message of
+// tag: a message is whole, so only the newest matters. It never waits
+// for the client. It's called by the hub's run goroutine.
 func (c *wsConn) put(tag string, msg []byte) {
 	c.mu.Lock()
 	if c.closed {

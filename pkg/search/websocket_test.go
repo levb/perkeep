@@ -70,12 +70,33 @@ func (wt *wsTest) conn() *wsConn {
 	wt.t.Helper()
 	c := newWSConn(wt.h, nil)
 	wt.h.wsHub.register <- c
-	wt.h.wsHub.watchReq <- watchReq{conn: c, tag: "q", q: &SearchQuery{
-		Constraint: &Constraint{Permanode: &PermanodeConstraint{}},
-		Limit:      50,
-	}}
+	wt.h.wsHub.watchReq <- watchReq{conn: c, tag: "q", q: allPermanodes(50)}
 	wt.result(c, "")
 	return c
+}
+
+// allPermanodes returns a search for all permanodes, up to limit.
+func allPermanodes(limit int) *SearchQuery {
+	return &SearchQuery{
+		Constraint: &Constraint{Permanode: &PermanodeConstraint{}},
+		Limit:      limit,
+	}
+}
+
+// within runs f, and fails the test if it hasn't returned within 10
+// seconds: what it waits for might be stuck for good.
+func within(t *testing.T, what string, f func() error) {
+	t.Helper()
+	errc := make(chan error, 1)
+	go func() { errc <- f() }()
+	select {
+	case err := <-errc:
+		if err != nil {
+			t.Fatalf("%s: %v", what, err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatalf("%s: still waiting after 10s", what)
+	}
 }
 
 // result takes what the hub has for c, as c's writePump would, until a
@@ -123,19 +144,10 @@ func (wt *wsTest) receive() blob.Ref {
 		if _, err := wt.id.BlobSource.ReceiveBlob(ctx, tb.BlobRef(), tb.Reader()); err != nil {
 			wt.t.Fatal(err)
 		}
-		done := make(chan error, 1)
-		go func() {
+		within(wt.t, fmt.Sprintf("indexing a blob of permanode %d", wt.seq), func() error {
 			_, err := blobserver.Receive(ctx, wt.id.Index, tb.BlobRef(), tb.Reader())
-			done <- err
-		}()
-		select {
-		case err := <-done:
-			if err != nil {
-				wt.t.Fatal(err)
-			}
-		case <-time.After(10 * time.Second):
-			wt.t.Fatalf("the index is still receiving a blob of permanode %d after 10s", wt.seq)
-		}
+			return err
+		})
 	}
 	return pn.BlobRef()
 }
@@ -156,22 +168,10 @@ func TestStalledWebsocketDoesntLockIndex(t *testing.T) {
 		wt.receive()
 	}
 
-	searched := make(chan error, 1)
-	go func() {
-		_, err := wt.h.Query(context.Background(), &SearchQuery{
-			Constraint: &Constraint{Permanode: &PermanodeConstraint{}},
-			Limit:      1,
-		})
-		searched <- err
-	}()
-	select {
-	case err := <-searched:
-		if err != nil {
-			t.Fatal(err)
-		}
-	case <-time.After(10 * time.Second):
-		t.Fatal("a search is still waiting after 10s")
-	}
+	within(t, "a search", func() error {
+		_, err := wt.h.Query(context.Background(), allPermanodes(1))
+		return err
+	})
 }
 
 // TestWebsocketSlowClientGetsLatest checks that the hub keeps only the
@@ -180,6 +180,7 @@ func TestStalledWebsocketDoesntLockIndex(t *testing.T) {
 // the slow client gets the newest result once it reads again.
 func TestWebsocketSlowClientGetsLatest(t *testing.T) {
 	wt := newWSTest(t)
+	wt.h.wsHub.searchInterval = 10 * time.Millisecond
 	reading := wt.conn()
 	slow := wt.conn()
 
@@ -193,26 +194,7 @@ func TestWebsocketSlowClientGetsLatest(t *testing.T) {
 	wt.result(reading, last.String())
 
 	// The slow client's search runs on its own, so its newest result
-	// can come after the reading client's.
-	deadline := time.Now().Add(10 * time.Second)
-	for {
-		var q []outMsg
-		for _, m := range pending(slow) {
-			if m.tag == "q" {
-				q = append(q, m)
-			}
-		}
-		if len(q) > 1 {
-			t.Fatalf("the hub has %d results of the slow client's search; want 1", len(q))
-		}
-		if len(q) == 1 && bytes.Contains(q[0].msg, []byte(last.String())) {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("the slow client's pending result doesn't have the newest permanode %v after 10s", last)
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
+	// can come after the reading client's; result waits for it.
 	wt.result(slow, last.String())
 }
 
@@ -238,9 +220,7 @@ func TestWebsocketUnsubscribeWhileWriting(t *testing.T) {
 	}()
 	for i := range 20 {
 		tag := fmt.Sprint("t", i)
-		wt.h.wsHub.watchReq <- watchReq{conn: c, tag: tag, q: &SearchQuery{
-			Constraint: &Constraint{Permanode: &PermanodeConstraint{}},
-		}}
+		wt.h.wsHub.watchReq <- watchReq{conn: c, tag: tag, q: allPermanodes(0)}
 		wt.receive()
 		wt.h.wsHub.watchReq <- watchReq{conn: c, tag: tag} // unsubscribe
 	}

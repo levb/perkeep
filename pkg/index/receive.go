@@ -74,7 +74,6 @@ type mutationMap struct {
 	signerID      string
 	kv            map[string]string // the keys and values we populate
 
-	// isSchema is whether the blob is a schema blob.
 	isSchema bool
 
 	// We record if we get a delete claim, so we can update

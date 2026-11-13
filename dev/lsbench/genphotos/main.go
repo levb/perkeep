@@ -27,6 +27,7 @@ import (
 	"image"
 	"image/jpeg"
 	"log"
+	"math"
 	"math/rand/v2"
 	"os"
 	"path/filepath"
@@ -73,10 +74,5 @@ func fill(rng *rand.Rand, b []byte) {
 	}
 }
 
-func intSqrt(n int) int {
-	r := 1
-	for r*r < n {
-		r++
-	}
-	return r
-}
+// intSqrt returns the least r >= 1 with r*r >= n.
+func intSqrt(n int) int { return max(1, int(math.Ceil(math.Sqrt(float64(n))))) }

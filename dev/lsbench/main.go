@@ -40,6 +40,7 @@ import (
 	"io"
 	"log"
 	"maps"
+	"math"
 	"math/rand/v2"
 	"mime"
 	"mime/multipart"
@@ -1063,14 +1064,7 @@ func pcts(v []float64) map[string]float64 {
 	return map[string]float64{"n": float64(len(s)), "p50": p(0.5), "p90": p(0.9), "p99": p(0.99), "max": round2(s[len(s)-1])}
 }
 
-func round2(f float64) float64 { return float64(int64(f*100+0.5*sign(f))) / 100 }
-
-func sign(f float64) float64 {
-	if f < 0 {
-		return -1
-	}
-	return 1
-}
+func round2(f float64) float64 { return math.Round(f*100) / 100 }
 
 func summaryText(m map[string]any) string {
 	keys := make([]string, 0, len(m))
