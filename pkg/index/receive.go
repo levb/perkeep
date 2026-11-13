@@ -489,7 +489,7 @@ func (ix *Index) ReceiveBlob(ctx context.Context, blobRef blob.Ref, source io.Re
 }
 
 // finishLocked does the bookkeeping once br's rows, mm, are committed:
-// adding it to the corpus, telling the receivers of SchemaBlobIndexed
+// adding it to the corpus, telling the SubscribeSchemaChanges channels
 // if it's a schema blob, and then either recording the blobs it still
 // depends on, or recording that it's indexed, waking the blobs waiting
 // for it.
@@ -500,7 +500,7 @@ func (ix *Index) finishLocked(ctx context.Context, op *indexOp, br blob.Ref, mm 
 		// Its rows are committed, so searches can differ, even if
 		// what follows fails. Searches run with ix.mu read-locked, so
 		// any that this wakes run after the corpus has it too.
-		for _, ch := range ix.schemaIndexed {
+		for _, ch := range ix.schemaChangeSubs {
 			select {
 			case ch <- struct{}{}:
 			default: // it has one already

@@ -53,7 +53,7 @@ type wsHub struct {
 	register       chan *wsConn
 	unregister     chan *wsConn
 	watchReq       chan watchReq
-	changed        <-chan struct{} // the index has indexed a schema blob; see Index.SchemaBlobIndexed
+	changed        <-chan struct{} // see Index.SubscribeSchemaChanges
 	updatedResults chan *watchedQuery
 	statusUpdate   chan json.RawMessage
 

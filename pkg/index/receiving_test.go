@@ -172,21 +172,21 @@ func TestIndexReceived(t *testing.T) {
 	}
 }
 
-// TestSchemaBlobIndexed checks that the channel from SchemaBlobIndexed
-// has a value whenever the index has indexed a schema blob, however the
-// blob reached the index, and none otherwise.
-func TestSchemaBlobIndexed(t *testing.T) {
+// TestSubscribeSchemaChanges checks that a channel from
+// SubscribeSchemaChanges has a value whenever the index has indexed a
+// schema blob, however the blob reached the index, and none otherwise.
+func TestSubscribeSchemaChanges(t *testing.T) {
 	ix := NewMemoryIndex()
 	ix.Logger = test.NewLogger(t, "")
 	src := new(test.Fetcher)
 	ix.InitBlobSource(src)
 	ix.hookBlobSource(src)
-	indexed := ix.SchemaBlobIndexed()
-	unread := ix.SchemaBlobIndexed() // nothing receives from it
+	changed := ix.SubscribeSchemaChanges()
+	unread := ix.SubscribeSchemaChanges() // nothing receives from it
 	want := func(what string, has bool) {
 		t.Helper()
 		select {
-		case <-indexed:
+		case <-changed:
 			if !has {
 				t.Errorf("%s: the channel has a value; want none", what)
 			}

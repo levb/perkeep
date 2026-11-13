@@ -95,9 +95,7 @@ type Index struct {
 
 	mu sync.RWMutex // guards following
 
-	// schemaIndexed are the channels SchemaBlobIndexed has returned.
-	schemaIndexed []chan struct{}
-
+	schemaChangeSubs []chan struct{} // one per SubscribeSchemaChanges calle
 	// inFlight is the set of ReceiveBlob calls currently in progress.
 	inFlight set.Set[*indexOp]
 
@@ -225,20 +223,20 @@ func (x *Index) InitBlobSource(blobSource blobserver.FetcherEnumerator) {
 	}
 }
 
-// SchemaBlobIndexed returns a channel that receives a value after the
-// index commits the rows of one or more schema blobs. Values coalesce:
-// the channel holds at most one, and a search started after receiving
-// it sees every schema blob indexed before. The index never blocks
-// sending to it.
+// SubscribeSchemaChanges returns a new channel that gets a value
+// whenever the index has added schema blobs, the only blobs that can
+// change search results. Many additions may share one value: a search
+// run after receiving it sees all of them. The index never waits on the
+// channel.
 //
-// Each call registers a new channel for the life of the index, so call
-// it once per long-lived receiver. The caller must not hold the index
-// lock.
-func (x *Index) SchemaBlobIndexed() <-chan struct{} {
+// Each call makes a new channel that the index keeps for its lifetime,
+// so call it once per listener, not per request. The caller must not
+// hold the index lock.
+func (x *Index) SubscribeSchemaChanges() <-chan struct{} {
 	ch := make(chan struct{}, 1)
 	x.Lock()
 	defer x.Unlock()
-	x.schemaIndexed = append(x.schemaIndexed, ch)
+	x.schemaChangeSubs = append(x.schemaChangeSubs, ch)
 	return ch
 }
 
